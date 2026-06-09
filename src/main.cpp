@@ -15,8 +15,15 @@
 
 // ── Tuning ───────────────────────────────────────────────────
 #define FADE_DURATION_MS 300   // How long a new LED takes to fully fade in/out
-#define MAX_MINUTES      240   // Maximum timer duration (4 Hours)
-#define DEFAULT_MINUTES  25    // Classic Pomodoro length
+#define MAX_SECONDS      14400 // Maximum timer duration (4 Hours = 240 * 60)
+#define DEFAULT_SECONDS  1500  // Classic Pomodoro length (25 mins * 60)
+#define INCREMENT_SECONDS 60   // Increment by exactly 1 minute
+
+// ── Encoder Debounce/Sensitivity Margin ──────────────────────
+// Standard encoders fire 4 pulses per physical "click" (detent). 
+// If your encoder is jumping too many minutes per click, increase this to 6 or 8.
+// If it feels too hard to turn, decrease it to 2.
+#define PULSES_PER_ACTION 4   
 
 // ── OLED Config ──────────────────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
@@ -30,16 +37,17 @@ unsigned long timerDurationMs = 0;
 unsigned long timeRemainingMs = 0;
 
 // Track the setting phase colors and timeouts
-CRGB currentSettingColor = CRGB(0, 0, 0); // The color currently being rendered
-CRGB targetSettingColor  = CRGB(0, 0, 0); // The color we want to morph into
+CRGB currentSettingColor = CRGB(0, 0, 0); 
+CRGB targetSettingColor  = CRGB(0, 0, 0); 
 unsigned long lastSettingChangeTime = 0;
-int lastSettingVal = DEFAULT_MINUTES;
+int lastSettingVal = DEFAULT_SECONDS;
 
 // ── Globals ──────────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
 
 volatile bool buttonPressed = false;
-volatile int  encoderValue  = DEFAULT_MINUTES;
+volatile int  rawPulses     = 0;
+volatile int  encoderSeconds = DEFAULT_SECONDS;
 
 // Per-LED brightness targets and current rendered brightness
 uint8_t targetBrightness[NUM_LEDS];   
@@ -57,19 +65,29 @@ void IRAM_ATTR onEncoderTick() {
 
     if (state == lastState) return;
 
+    // Accumulate raw state changes
     if ((lastState == 0b11 && state == 0b01) ||
         (lastState == 0b01 && state == 0b00) ||
         (lastState == 0b00 && state == 0b10) ||
         (lastState == 0b10 && state == 0b11)) {
-        encoderValue++;
+        rawPulses++;
     } else if ((lastState == 0b11 && state == 0b10) ||
                (lastState == 0b10 && state == 0b00) ||
                (lastState == 0b00 && state == 0b01) ||
                (lastState == 0b01 && state == 0b11)) {
-        encoderValue--;
+        rawPulses--;
     }
 
     lastState = state;
+
+    // Only apply the change if we have accumulated enough valid pulses
+    if (rawPulses >= PULSES_PER_ACTION) {
+        encoderSeconds += INCREMENT_SECONDS;
+        rawPulses = 0;
+    } else if (rawPulses <= -PULSES_PER_ACTION) {
+        encoderSeconds -= INCREMENT_SECONDS;
+        rawPulses = 0;
+    }
 }
 
 // ── Button ISR ───────────────────────────────────────────────
@@ -125,17 +143,17 @@ void setup() {
 void loop() {
     // Snapshot volatile state safely
     noInterrupts();
-    int  val     = encoderValue;
+    int  val     = encoderSeconds;
     bool pressed = buttonPressed;
     if (buttonPressed) buttonPressed = false;
     interrupts();
 
     // ── STATE MACHINE LOGIC ──
     if (currentState == SETTING) {
-        // Clamp minutes between 1 and MAX_MINUTES
-        val = constrain(val, 1, MAX_MINUTES);
+        // Clamp seconds between INCREMENT_SECONDS and MAX_SECONDS
+        val = constrain(val, INCREMENT_SECONDS, MAX_SECONDS);
         noInterrupts();
-        encoderValue = val;
+        encoderSeconds = val;
         interrupts();
 
         // Trigger smooth Green/Red flashes based on turn direction
@@ -157,7 +175,7 @@ void loop() {
 
         if (pressed) {
             currentState = RUNNING;
-            timerDurationMs = (unsigned long)val * 60000UL;
+            timerDurationMs = (unsigned long)val * 1000UL; // Convert sec to ms
             timerStartTime = millis();
             timeRemainingMs = timerDurationMs;
         }
@@ -167,7 +185,7 @@ void loop() {
             // Cancel timer
             currentState = SETTING;
             noInterrupts();
-            encoderValue = val; // restore encoder back to last set value
+            encoderSeconds = val; // restore encoder back to last set value
             interrupts();
         } else {
             unsigned long elapsed = millis() - timerStartTime;
@@ -208,8 +226,6 @@ void loop() {
     }
 
     // ── SMOOTH COLOR BLEND (For Setting Mode) ──
-    // nblend morphs currentSettingColor towards targetSettingColor by a fraction (0-255).
-    // 25 roughly equals a 10% step per frame, creating a rapid but smooth crossfade.
     nblend(currentSettingColor, targetSettingColor, 25);
 
     // ── FADE EXECUTION & COLOR MAPPING ──
@@ -230,7 +246,6 @@ void loop() {
 
         // Apply colors based on State
         if (currentState == SETTING) {
-            // Apply the smoothly blended color, scaled by the individual LED's brightness fade
             leds[i] = CRGB(
                 (currentSettingColor.r * currentBrightness[i]) / 255,
                 (currentSettingColor.g * currentBrightness[i]) / 255,
@@ -256,33 +271,30 @@ void loop() {
             u8g2.setFont(u8g2_font_ncenB10_tr);
             u8g2.drawStr(0, 15, "Set Timer:");
             
-            u8g2.setFont(u8g2_font_ncenB24_tr);
-            sprintf(timeBuf, "%02d:00", val);
+            int h = val / 3600;
+            int m = (val % 3600) / 60;
+            int s = val % 60;
             
-            // Shift left slightly if it's over 99 mins to fit on screen
-            if (val >= 100) {
-                u8g2.drawStr(2, 55, timeBuf);
-            } else {
-                u8g2.drawStr(18, 55, timeBuf);
-            }
+            // Scaled down to size 18 to fit HH:MM:SS horizontally
+            u8g2.setFont(u8g2_font_ncenB18_tr); 
+            sprintf(timeBuf, "%d:%02d:%02d", h, m, s);
+            
+            u8g2.drawStr(12, 50, timeBuf);
         } 
         else if (currentState == RUNNING) {
             u8g2.setFont(u8g2_font_ncenB10_tr);
             u8g2.drawStr(0, 15, "Focusing:");
 
             unsigned long secsRemaining = timeRemainingMs / 1000;
-            int m = secsRemaining / 60;
+            int h = secsRemaining / 3600;
+            int m = (secsRemaining % 3600) / 60;
             int s = secsRemaining % 60;
 
-            u8g2.setFont(u8g2_font_ncenB24_tr);
-            sprintf(timeBuf, "%02d:%02d", m, s);
+            // Scaled down to size 18 to fit HH:MM:SS horizontally
+            u8g2.setFont(u8g2_font_ncenB18_tr);
+            sprintf(timeBuf, "%d:%02d:%02d", h, m, s);
             
-            // Shift left slightly if it's over 99 mins
-            if (m >= 100) {
-                u8g2.drawStr(2, 50, timeBuf); 
-            } else {
-                u8g2.drawStr(18, 50, timeBuf);
-            }
+            u8g2.drawStr(12, 48, timeBuf);
 
             // Progress Bar
             int barWidth = map(timeRemainingMs, 0, timerDurationMs, 0, 128);
