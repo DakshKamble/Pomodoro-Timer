@@ -14,25 +14,32 @@
 #define ENC_SW        D3
 
 // ── Tuning ───────────────────────────────────────────────────
-#define COUNTS_PER_REV   80    // Adjust until one full rotation = full ring
-#define FADE_DURATION_MS 300   // How long a new LED takes to fully fade in
+#define FADE_DURATION_MS 300   // How long a new LED takes to fully fade in/out
+#define MAX_MINUTES      60    // Maximum timer duration
+#define DEFAULT_MINUTES  25    // Classic Pomodoro length
 
 // ── OLED Config ──────────────────────────────────────────────
-// Changed to SSD1306 to fix the interleaved black lines issue.
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
+// ── State Machine ────────────────────────────────────────────
+enum TimerState { SETTING, RUNNING, FINISHED };
+TimerState currentState = SETTING;
 
-// ── State ────────────────────────────────────────────────────
+unsigned long timerStartTime = 0;
+unsigned long timerDurationMs = 0;
+unsigned long timeRemainingMs = 0;
+
+// ── Globals ──────────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
 
 volatile bool buttonPressed = false;
-volatile int  encoderValue  = 0;
+volatile int  encoderValue  = DEFAULT_MINUTES;
 
 // Per-LED brightness targets and current rendered brightness
-uint8_t targetBrightness[NUM_LEDS];   // 0 or 255 — what each LED should be
-uint8_t currentBrightness[NUM_LEDS];  // actual rendered brightness (fading toward target)
-unsigned long fadeStartTime[NUM_LEDS];// when this LED's current fade began
-uint8_t fadeStartBrightness[NUM_LEDS];// brightness at the moment fade started
+uint8_t targetBrightness[NUM_LEDS];   
+uint8_t currentBrightness[NUM_LEDS];  
+unsigned long fadeStartTime[NUM_LEDS];
+uint8_t fadeStartBrightness[NUM_LEDS];
 
 // ── Encoder ISR ──────────────────────────────────────────────
 void IRAM_ATTR onEncoderTick() {
@@ -63,18 +70,16 @@ void IRAM_ATTR onEncoderTick() {
 void IRAM_ATTR onButtonPress() {
     static unsigned long lastPress = 0;
     unsigned long now = millis();
-    if (now - lastPress < 200) return;
+    if (now - lastPress < 250) return; // Debounce
     lastPress = now;
     buttonPressed = true;
 }
 
 // ── Helpers ──────────────────────────────────────────────────
-
-// Call when a LED's target changes — kicks off a new fade from wherever it is now
 void startFade(int i, uint8_t newTarget) {
-    if (targetBrightness[i] == newTarget) return; // already heading there
+    if (targetBrightness[i] == newTarget) return; 
     targetBrightness[i]    = newTarget;
-    fadeStartBrightness[i] = currentBrightness[i]; // start from current position
+    fadeStartBrightness[i] = currentBrightness[i]; 
     fadeStartTime[i]       = millis();
 }
 
@@ -98,12 +103,10 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ENC_DT),  onEncoderTick, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_SW),  onButtonPress, FALLING);
 
-    // Initialize OLED Display
-    u8g2.setI2CAddress(0x78); 
+    u8g2.setI2CAddress(0x78);
     u8g2.begin();
-    u8g2.setBusClock(400000); 
+    u8g2.setBusClock(400000);
 
-    // Init all LEDs off
     for (int i = 0; i < NUM_LEDS; i++) {
         targetBrightness[i]    = 0;
         currentBrightness[i]   = 0;
@@ -114,96 +117,147 @@ void setup() {
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
-    // Snapshot volatile state
+    // Snapshot volatile state safely
     noInterrupts();
     int  val     = encoderValue;
     bool pressed = buttonPressed;
     if (buttonPressed) buttonPressed = false;
     interrupts();
 
-    // Clamp encoder so it never goes below 0 or above full ring
-    val = constrain(val, 0, COUNTS_PER_REV);
-    noInterrupts();
-    encoderValue = val;
-    interrupts();
+    // ── STATE MACHINE LOGIC ──
+    if (currentState == SETTING) {
+        // Clamp minutes between 1 and MAX_MINUTES
+        val = constrain(val, 1, MAX_MINUTES);
+        noInterrupts();
+        encoderValue = val;
+        interrupts();
 
-    // Button: instant full white flash, then restore
-    if (pressed) {
-        Serial.println("Button clicked!");
-        fill_solid(leds, NUM_LEDS, CRGB::White);
-        FastLED.show();
-        
-        // Show indicator on OLED briefly
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB14_tr);
-        u8g2.drawStr(10, 35, "CLICKED!");
-        u8g2.sendBuffer();
-        
-        delay(200);
+        if (pressed) {
+            currentState = RUNNING;
+            timerDurationMs = (unsigned long)val * 60000UL;
+            timerStartTime = millis();
+            timeRemainingMs = timerDurationMs;
+        }
+    } 
+    else if (currentState == RUNNING) {
+        if (pressed) {
+            // Cancel timer
+            currentState = SETTING;
+            noInterrupts();
+            encoderValue = val; // restore encoder back to last set value
+            interrupts();
+        } else {
+            unsigned long elapsed = millis() - timerStartTime;
+            if (elapsed >= timerDurationMs) {
+                currentState = FINISHED;
+                timerStartTime = millis(); // Reset start time for blink animation
+            } else {
+                timeRemainingMs = timerDurationMs - elapsed;
+            }
+        }
+    }
+    else if (currentState == FINISHED) {
+        if (pressed) {
+            currentState = SETTING;
+        }
     }
 
-    // How many LEDs should be fully ON based on encoder position
-    int litLeds = map(val, 0, COUNTS_PER_REV, 0, NUM_LEDS);
+    // ── LED TARGET LOGIC ──
+    int litLeds = 0;
 
-    // Update fade targets — only trigger startFade() when target actually changes
+    if (currentState == SETTING) {
+        // Show proportional ring of time being set
+        litLeds = map(val, 0, MAX_MINUTES, 0, NUM_LEDS);
+        if (val > 0 && litLeds == 0) litLeds = 1;
+    } 
+    else if (currentState == RUNNING) {
+        // Map remaining time to LEDs (using ceil equivalent so last LED stays on until 0)
+        litLeds = (timeRemainingMs * NUM_LEDS + timerDurationMs - 1) / timerDurationMs;
+    }
+
+    // Update fade targets
     for (int i = 0; i < NUM_LEDS; i++) {
-        uint8_t desired = (i < litLeds) ? 255 : 0;
+        uint8_t desired = 0;
+        
+        if (currentState == FINISHED) {
+            // Blink all LEDs Red when done
+            desired = ((millis() - timerStartTime) % 1000 < 500) ? 255 : 0;
+        } else {
+            desired = (i < litLeds) ? 255 : 0;
+        }
+        
         startFade(i, desired);
     }
 
-    // Advance each LED's fade
+    // ── FADE EXECUTION & COLOR MAPPING ──
     unsigned long now = millis();
     for (int i = 0; i < NUM_LEDS; i++) {
-        if (currentBrightness[i] == targetBrightness[i]) continue; // settled
-
-        unsigned long elapsed = now - fadeStartTime[i];
-
-        if (elapsed >= FADE_DURATION_MS) {
-            // Fade complete — snap to target
-            currentBrightness[i] = targetBrightness[i];
-        } else {
-            float t = (float)elapsed / (float)FADE_DURATION_MS;
-            float eased = easeInOut(t);
-            currentBrightness[i] = (uint8_t)(
-                fadeStartBrightness[i] + eased * ((int)targetBrightness[i] - (int)fadeStartBrightness[i])
-            );
+        if (currentBrightness[i] != targetBrightness[i]) {
+            unsigned long elapsed = now - fadeStartTime[i];
+            if (elapsed >= FADE_DURATION_MS) {
+                currentBrightness[i] = targetBrightness[i];
+            } else {
+                float t = (float)elapsed / (float)FADE_DURATION_MS;
+                float eased = easeInOut(t);
+                currentBrightness[i] = (uint8_t)(
+                    fadeStartBrightness[i] + eased * ((int)targetBrightness[i] - (int)fadeStartBrightness[i])
+                );
+            }
         }
 
-        leds[i] = CRGB(0, currentBrightness[i], 0); // Green, brightness-scaled
+        // Apply colors based on State
+        if (currentState == SETTING) {
+            leds[i] = CRGB(0, 0, currentBrightness[i]); // Blue for Setting
+        } else if (currentState == RUNNING) {
+            leds[i] = CRGB(0, currentBrightness[i], 0); // Green for Running
+        } else {
+            leds[i] = CRGB(currentBrightness[i], 0, 0); // Red for Finished
+        }
     }
 
     FastLED.show();
 
-    // Throttled serial & OLED updates (Max 5 FPS to keep animations smooth)
+    // ── OLED UPDATE LOGIC (Throttled to ~10 FPS) ──
     static unsigned long lastPrint = 0;
-    if (millis() - lastPrint >= 200) {
-        // Serial Debug
-        Serial.print("Encoder: "); Serial.print(val);
-        Serial.print("   Lit: ");   Serial.println(litLeds);
-
-        // OLED Update
+    if (now - lastPrint >= 100) {
         u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB10_tr); // Standard crisp font
-        
-        // Line 1: Encoder Value
-        u8g2.setCursor(0, 20);
-        u8g2.print("Encoder: "); 
-        u8g2.print(val);
-        
-        // Line 2: Lit LEDs
-        u8g2.setCursor(0, 45);
-        u8g2.print("Lit LEDs: "); 
-        u8g2.print(litLeds);
-        
-        // Progress Bar showing percentage of ring lit
-        int barWidth = map(val, 0, COUNTS_PER_REV, 0, 128);
-        u8g2.drawFrame(0, 55, 128, 9);
-        u8g2.drawBox(0, 55, barWidth, 9);
+
+        char timeBuf[16];
+
+        if (currentState == SETTING) {
+            u8g2.setFont(u8g2_font_ncenB10_tr);
+            u8g2.drawStr(0, 15, "Set Timer:");
+            
+            u8g2.setFont(u8g2_font_ncenB24_tr);
+            sprintf(timeBuf, "%02d:00", val);
+            // Center the text roughly
+            u8g2.drawStr(18, 55, timeBuf);
+        } 
+        else if (currentState == RUNNING) {
+            u8g2.setFont(u8g2_font_ncenB10_tr);
+            u8g2.drawStr(0, 15, "Focusing:");
+
+            unsigned long secsRemaining = timeRemainingMs / 1000;
+            int m = secsRemaining / 60;
+            int s = secsRemaining % 60;
+
+            u8g2.setFont(u8g2_font_ncenB24_tr);
+            sprintf(timeBuf, "%02d:%02d", m, s);
+            u8g2.drawStr(18, 50, timeBuf);
+
+            // Progress Bar
+            int barWidth = map(timeRemainingMs, 0, timerDurationMs, 0, 128);
+            u8g2.drawFrame(0, 58, 128, 6);
+            u8g2.drawBox(0, 58, barWidth, 6);
+        }
+        else if (currentState == FINISHED) {
+            u8g2.setFont(u8g2_font_ncenB14_tr);
+            u8g2.drawStr(12, 40, "TIME'S UP!");
+        }
 
         u8g2.sendBuffer();
-
-        lastPrint = millis();
+        lastPrint = now;
     }
 
-    delay(10);
+    delay(10); // Yield for stability
 }
