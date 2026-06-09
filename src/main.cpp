@@ -8,24 +8,67 @@
 
 CRGB leds[NUM_LEDS];
 
-void setup() {
-    FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
-    FastLED.setBrightness(BRIGHTNESS);
+// Encoder Config
+#define ENC_CLK D1
+#define ENC_DT D2
+#define ENC_SW D3
+
+volatile bool buttonPressed = false;
+volatile int encoderValue = 0;
+
+// Interrupt --- calling on every falling edge of CLK
+
+void IRAM_ATTR onEncoderTick() {
+    if(digitalRead(ENC_DT) == HIGH) {
+        encoderValue++; // Clockwise
+    } else {
+        encoderValue--; // Anticlockwise
+    }
 }
 
+void IRAM_ATTR onButtonPress() {
+    buttonPressed = true;
+}
+
+//////// SETUP /////////////////////////////////
+
+void setup() {
+    Serial.begin(115200);
+
+    FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
+    FastLED.setBrightness(BRIGHTNESS);
+
+    pinMode(ENC_CLK, INPUT_PULLUP);
+    pinMode(ENC_DT, INPUT_PULLUP);
+    pinMode(ENC_SW, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoderTick, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_SW), onButtonPress, FALLING);
+}
+
+//////// LOOP ////////////////////////////////////////
 void loop() {
-  // Red
-  fill_solid(leds, NUM_LEDS, CRGB::Red);
-  FastLED.show();
-  delay(100);
+    // Snapshot volatile state safely
+    noInterrupts();
+    int  val     = encoderValue;
+    bool pressed = buttonPressed;
+    if (buttonPressed) buttonPressed = false;
+    interrupts();
 
-  // Green
-  fill_solid(leds, NUM_LEDS, CRGB::Green);
-  FastLED.show();
-  delay(100);
+    if (pressed) {
+        Serial.println("Button clicked!");
+        fill_solid(leds, NUM_LEDS, CRGB::White);
+        FastLED.show();
+        delay(200);
+    }
 
-  // Blue
-  fill_solid(leds, NUM_LEDS, CRGB::Blue);
-  FastLED.show();
-  delay(100);
+    // Map encoder to LED count (0–12), clamped
+    int litLeds = constrain(val, 0, NUM_LEDS);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = (i < litLeds) ? CRGB::Green : CRGB::Black;
+    }
+    FastLED.show();
+
+    Serial.print("Encoder: "); Serial.println(val);
+    delay(50);
 }
