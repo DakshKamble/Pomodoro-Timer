@@ -30,7 +30,8 @@ unsigned long timerDurationMs = 0;
 unsigned long timeRemainingMs = 0;
 
 // Track the setting phase colors and timeouts
-CRGB settingColor = CRGB(0, 0, 0);
+CRGB currentSettingColor = CRGB(0, 0, 0); // The color currently being rendered
+CRGB targetSettingColor  = CRGB(0, 0, 0); // The color we want to morph into
 unsigned long lastSettingChangeTime = 0;
 int lastSettingVal = DEFAULT_MINUTES;
 
@@ -139,11 +140,11 @@ void loop() {
 
         // Trigger smooth Green/Red flashes based on turn direction
         if (val > lastSettingVal) {
-            settingColor = CRGB(0, 255, 0); // Green for increase
+            targetSettingColor = CRGB(0, 255, 0); // Target Green for increase
             lastSettingChangeTime = millis();
             for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
         } else if (val < lastSettingVal) {
-            settingColor = CRGB(255, 0, 0); // Red for decrease
+            targetSettingColor = CRGB(255, 0, 0); // Target Red for decrease
             lastSettingChangeTime = millis();
             for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
         }
@@ -206,6 +207,11 @@ void loop() {
         }
     }
 
+    // ── SMOOTH COLOR BLEND (For Setting Mode) ──
+    // nblend morphs currentSettingColor towards targetSettingColor by a fraction (0-255).
+    // 25 roughly equals a 10% step per frame, creating a rapid but smooth crossfade.
+    nblend(currentSettingColor, targetSettingColor, 25);
+
     // ── FADE EXECUTION & COLOR MAPPING ──
     unsigned long now = millis();
     for (int i = 0; i < NUM_LEDS; i++) {
@@ -224,11 +230,11 @@ void loop() {
 
         // Apply colors based on State
         if (currentState == SETTING) {
-            // Scale the dynamically chosen setting color (Green or Red) by the current fade brightness
+            // Apply the smoothly blended color, scaled by the individual LED's brightness fade
             leds[i] = CRGB(
-                (settingColor.r * currentBrightness[i]) / 255,
-                (settingColor.g * currentBrightness[i]) / 255,
-                (settingColor.b * currentBrightness[i]) / 255
+                (currentSettingColor.r * currentBrightness[i]) / 255,
+                (currentSettingColor.g * currentBrightness[i]) / 255,
+                (currentSettingColor.b * currentBrightness[i]) / 255
             );
         } else if (currentState == RUNNING) {
             leds[i] = CRGB(0, currentBrightness[i], 0); // Green for Running
