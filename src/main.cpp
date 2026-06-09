@@ -2,6 +2,8 @@
 #include <FastLED.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <esp_sleep.h> // ESP32 Sleep Library
+#include <Preferences.h> // ESP32 Non-Volatile Storage Library
 
 // ── NeoPixel Config ──────────────────────────────────────────
 #define NUM_LEDS      12
@@ -16,20 +18,18 @@
 // ── Tuning ───────────────────────────────────────────────────
 #define FADE_DURATION_MS 300   // How long a new LED takes to fully fade in/out
 #define MAX_SECONDS      14400 // Maximum timer duration (4 Hours = 240 * 60)
-#define DEFAULT_SECONDS  1500  // Classic Pomodoro length (25 mins * 60)
 #define INCREMENT_SECONDS 60   // Increment by exactly 1 minute
+#define SLEEP_TIMEOUT_MS  10000 // 10 seconds of inactivity before deep sleep
+#define LONG_PRESS_MS     800  // Milliseconds required to trigger a long press
 
 // ── Encoder Debounce/Sensitivity Margin ──────────────────────
-// Standard encoders fire 4 pulses per physical "click" (detent). 
-// If your encoder is jumping too many minutes per click, increase this to 6 or 8.
-// If it feels too hard to turn, decrease it to 2.
 #define PULSES_PER_ACTION 4   
 
 // ── OLED Config ──────────────────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 // ── State Machine ────────────────────────────────────────────
-enum TimerState { SETTING, RUNNING, FINISHED };
+enum TimerState { SETTING, RUNNING, FINISHED, CONFIG_DEFAULT_TIME };
 TimerState currentState = SETTING;
 
 unsigned long timerStartTime = 0;
@@ -40,14 +40,25 @@ unsigned long timeRemainingMs = 0;
 CRGB currentSettingColor = CRGB(0, 0, 0); 
 CRGB targetSettingColor  = CRGB(0, 0, 0); 
 unsigned long lastSettingChangeTime = 0;
-int lastSettingVal = DEFAULT_SECONDS;
+int lastSettingVal = 0;
+
+// Track inactivity for deep sleep
+unsigned long lastActivityTime = 0;
+
+// Storage
+Preferences preferences;
+unsigned int defaultSeconds = 1500; // 25 mins default, overridden by Preferences
+
+// RTC memory variables survive Deep Sleep resets
+RTC_DATA_ATTR int rtcSavedSeconds = 1500;
 
 // ── Globals ──────────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
 
-volatile bool buttonPressed = false;
-volatile int  rawPulses     = 0;
-volatile int  encoderSeconds = DEFAULT_SECONDS;
+volatile bool shortPressFlag = false;
+volatile bool longPressFlag  = false;
+volatile int  rawPulses      = 0;
+volatile int  encoderSeconds = 1500;
 
 // Per-LED brightness targets and current rendered brightness
 uint8_t targetBrightness[NUM_LEDS];   
@@ -91,12 +102,45 @@ void IRAM_ATTR onEncoderTick() {
 }
 
 // ── Button ISR ───────────────────────────────────────────────
-void IRAM_ATTR onButtonPress() {
-    static unsigned long lastPress = 0;
-    unsigned long now = millis();
-    if (now - lastPress < 250) return; // Debounce
-    lastPress = now;
-    buttonPressed = true;
+void IRAM_ATTR onButtonStateChange() {
+    static unsigned long pressTime = 0;
+    bool isPressed = (digitalRead(ENC_SW) == LOW);
+    
+    if (isPressed) {
+        pressTime = millis();
+    } else {
+        if (pressTime > 0) {
+            unsigned long duration = millis() - pressTime;
+            if (duration >= LONG_PRESS_MS) {
+                longPressFlag = true;
+            } else if (duration > 50) { // 50ms Debounce for short press
+                shortPressFlag = true;
+            }
+            pressTime = 0;
+        }
+    }
+}
+
+// ── Deep Sleep Helper ────────────────────────────────────────
+void enterDeepSleep() {
+    Serial.println("Going to sleep...");
+
+    // Save current setting to RTC memory so it remembers when it wakes up
+    rtcSavedSeconds = encoderSeconds;
+
+    // Turn off LEDs
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+
+    // Turn off OLED display safely
+    u8g2.setPowerSave(1);
+
+    // Configure the button pin (ENC_SW) as the wake-up source for ESP32-C3
+    pinMode(ENC_SW, INPUT_PULLUP);
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << ENC_SW, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+    // Enter deep sleep indefinitely
+    esp_deep_sleep_start();
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -116,16 +160,35 @@ float easeInOut(float t) {
 void setup() {
     Serial.begin(115200);
 
+    // Load default timer value from permanent memory (Preferences)
+    preferences.begin("pomodoro", false);
+    defaultSeconds = preferences.getUInt("defaultSec", 1500); // 1500s = 25m fallback
+
+    // Wait until the button is RELEASED before continuing. 
+    // This stops the "wake up" button press from registering instantly.
+    pinMode(ENC_SW,  INPUT_PULLUP);
+    while (digitalRead(ENC_SW) == LOW) {
+        delay(10);
+    }
+
+    // If we woke up from deep sleep, restore exact last value. 
+    // If hard boot, load the saved user default.
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+        encoderSeconds = rtcSavedSeconds;
+    } else {
+        encoderSeconds = defaultSeconds;
+    }
+    lastSettingVal = encoderSeconds;
+
     FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
     FastLED.setBrightness(BRIGHTNESS);
 
     pinMode(ENC_CLK, INPUT_PULLUP);
     pinMode(ENC_DT,  INPUT_PULLUP);
-    pinMode(ENC_SW,  INPUT_PULLUP);
 
     attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoderTick, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_DT),  onEncoderTick, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC_SW),  onButtonPress, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_SW),  onButtonStateChange, CHANGE); // Note: Changed to CHANGE for duration tracking
 
     u8g2.setI2CAddress(0x78);
     u8g2.begin();
@@ -137,69 +200,117 @@ void setup() {
         fadeStartBrightness[i] = 0;
         fadeStartTime[i]       = 0;
     }
+
+    lastActivityTime = millis(); // Reset activity timer on boot
 }
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
     // Snapshot volatile state safely
     noInterrupts();
-    int  val     = encoderSeconds;
-    bool pressed = buttonPressed;
-    if (buttonPressed) buttonPressed = false;
+    int  val         = encoderSeconds;
+    bool shortPress  = shortPressFlag;
+    bool longPress   = longPressFlag;
+    if (shortPressFlag) shortPressFlag = false;
+    if (longPressFlag)  longPressFlag  = false;
     interrupts();
+
+    // Reset inactivity timer if the user does anything
+    static int lastActivityVal = val;
+    if (shortPress || longPress || val != lastActivityVal) {
+        lastActivityTime = millis();
+        lastActivityVal = val;
+    }
+
+    // Check for Deep Sleep condition (10s of inactivity while NOT running)
+    if ((currentState == SETTING || currentState == FINISHED || currentState == CONFIG_DEFAULT_TIME) 
+        && (millis() - lastActivityTime > SLEEP_TIMEOUT_MS)) {
+        enterDeepSleep();
+    }
 
     // ── STATE MACHINE LOGIC ──
     if (currentState == SETTING) {
-        // Clamp seconds between INCREMENT_SECONDS and MAX_SECONDS
         val = constrain(val, INCREMENT_SECONDS, MAX_SECONDS);
-        noInterrupts();
-        encoderSeconds = val;
-        interrupts();
+        noInterrupts(); encoderSeconds = val; interrupts();
 
         // Trigger smooth Green/Red flashes based on turn direction
         if (val > lastSettingVal) {
-            targetSettingColor = CRGB(0, 255, 0); // Target Green for increase
+            targetSettingColor = CRGB(0, 255, 0); // Target Green
             lastSettingChangeTime = millis();
             for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
         } else if (val < lastSettingVal) {
-            targetSettingColor = CRGB(255, 0, 0); // Target Red for decrease
+            targetSettingColor = CRGB(255, 0, 0); // Target Red
             lastSettingChangeTime = millis();
             for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
         }
         lastSettingVal = val;
 
-        // Smoothly fade out to black if the encoder stops moving
         if (millis() - lastSettingChangeTime > 300) {
             for (int i = 0; i < NUM_LEDS; i++) startFade(i, 0);
         }
 
-        if (pressed) {
+        if (shortPress) {
             currentState = RUNNING;
-            timerDurationMs = (unsigned long)val * 1000UL; // Convert sec to ms
+            timerDurationMs = (unsigned long)val * 1000UL; 
             timerStartTime = millis();
             timeRemainingMs = timerDurationMs;
+        } else if (longPress) {
+            currentState = CONFIG_DEFAULT_TIME;
+            noInterrupts(); encoderSeconds = defaultSeconds; interrupts(); // Load current default into encoder
+            lastSettingVal = defaultSeconds;
         }
     } 
+    else if (currentState == CONFIG_DEFAULT_TIME) {
+        val = constrain(val, INCREMENT_SECONDS, MAX_SECONDS);
+        noInterrupts(); encoderSeconds = val; interrupts();
+
+        // Use Blue/Purple to indicate we are changing the default
+        if (val > lastSettingVal) {
+            targetSettingColor = CRGB(0, 100, 255); // Blue for increase
+            lastSettingChangeTime = millis();
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
+        } else if (val < lastSettingVal) {
+            targetSettingColor = CRGB(150, 0, 255); // Purple for decrease
+            lastSettingChangeTime = millis();
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
+        }
+        lastSettingVal = val;
+
+        if (millis() - lastSettingChangeTime > 300) {
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 0);
+        }
+
+        // Any press saves the new default and exits back to Setting mode
+        if (shortPress || longPress) {
+            defaultSeconds = val;
+            preferences.putUInt("defaultSec", defaultSeconds); // Save to Non-Volatile Memory
+            
+            currentState = SETTING;
+            noInterrupts(); encoderSeconds = defaultSeconds; interrupts();
+            lastSettingVal = defaultSeconds;
+        }
+    }
     else if (currentState == RUNNING) {
-        if (pressed) {
+        if (shortPress) {
             // Cancel timer
             currentState = SETTING;
-            noInterrupts();
-            encoderSeconds = val; // restore encoder back to last set value
-            interrupts();
+            lastActivityTime = millis();
+            noInterrupts(); encoderSeconds = val; interrupts();
         } else {
             unsigned long elapsed = millis() - timerStartTime;
             if (elapsed >= timerDurationMs) {
                 currentState = FINISHED;
-                timerStartTime = millis(); // Reset start time for blink animation
+                timerStartTime = millis(); 
+                lastActivityTime = millis(); 
             } else {
                 timeRemainingMs = timerDurationMs - elapsed;
             }
         }
     }
     else if (currentState == FINISHED) {
-        if (pressed) {
+        if (shortPress || longPress) {
             currentState = SETTING;
+            lastActivityTime = millis();
         }
     }
 
@@ -210,9 +321,7 @@ void loop() {
         litLeds = (timeRemainingMs * NUM_LEDS + timerDurationMs - 1) / timerDurationMs;
     }
 
-    // We only update targets here for RUNNING and FINISHED, 
-    // because SETTING handles its own all-LED targets above.
-    if (currentState != SETTING) {
+    if (currentState != SETTING && currentState != CONFIG_DEFAULT_TIME) {
         for (int i = 0; i < NUM_LEDS; i++) {
             uint8_t desired = 0;
             if (currentState == FINISHED) {
@@ -225,7 +334,7 @@ void loop() {
         }
     }
 
-    // ── SMOOTH COLOR BLEND (For Setting Mode) ──
+    // ── SMOOTH COLOR BLEND (For Setting Modes) ──
     nblend(currentSettingColor, targetSettingColor, 25);
 
     // ── FADE EXECUTION & COLOR MAPPING ──
@@ -245,7 +354,7 @@ void loop() {
         }
 
         // Apply colors based on State
-        if (currentState == SETTING) {
+        if (currentState == SETTING || currentState == CONFIG_DEFAULT_TIME) {
             leds[i] = CRGB(
                 (currentSettingColor.r * currentBrightness[i]) / 255,
                 (currentSettingColor.g * currentBrightness[i]) / 255,
@@ -267,18 +376,20 @@ void loop() {
 
         char timeBuf[16];
 
-        if (currentState == SETTING) {
+        if (currentState == SETTING || currentState == CONFIG_DEFAULT_TIME) {
             u8g2.setFont(u8g2_font_ncenB10_tr);
-            u8g2.drawStr(0, 15, "Set Timer:");
+            if (currentState == CONFIG_DEFAULT_TIME) {
+                u8g2.drawStr(0, 15, "Set Default:");
+            } else {
+                u8g2.drawStr(0, 15, "Set Timer:");
+            }
             
             int h = val / 3600;
             int m = (val % 3600) / 60;
             int s = val % 60;
             
-            // Scaled down to size 18 to fit HH:MM:SS horizontally
             u8g2.setFont(u8g2_font_ncenB18_tr); 
             sprintf(timeBuf, "%d:%02d:%02d", h, m, s);
-            
             u8g2.drawStr(12, 50, timeBuf);
         } 
         else if (currentState == RUNNING) {
@@ -290,10 +401,8 @@ void loop() {
             int m = (secsRemaining % 3600) / 60;
             int s = secsRemaining % 60;
 
-            // Scaled down to size 18 to fit HH:MM:SS horizontally
             u8g2.setFont(u8g2_font_ncenB18_tr);
             sprintf(timeBuf, "%d:%02d:%02d", h, m, s);
-            
             u8g2.drawStr(12, 48, timeBuf);
 
             // Progress Bar
