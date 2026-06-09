@@ -1,18 +1,31 @@
 #include <Arduino.h>
+#include <FastLED.h>
 
-// put function declarations here:
-int myFunction(int, int);
+// NeoPixel Config
+#define NUM_LEDS 12
+#define LED_PIN D0
+#define BRIGHTNESS 25
+
+CRGB leds[NUM_LEDS];
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+    FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
+    FastLED.setBrightness(BRIGHTNESS);
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
+  // Red
+  fill_solid(leds, NUM_LEDS, CRGB::Red);
+  FastLED.show();
+  delay(100);
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  // Green
+  fill_solid(leds, NUM_LEDS, CRGB::Green);
+  FastLED.show();
+  delay(100);
+
+  // Blue
+  fill_solid(leds, NUM_LEDS, CRGB::Blue);
+  FastLED.show();
+  delay(100);
 }
