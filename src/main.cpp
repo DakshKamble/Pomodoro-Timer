@@ -15,7 +15,7 @@
 
 // ── Tuning ───────────────────────────────────────────────────
 #define FADE_DURATION_MS 300   // How long a new LED takes to fully fade in/out
-#define MAX_MINUTES      60    // Maximum timer duration
+#define MAX_MINUTES      240   // Maximum timer duration (4 Hours)
 #define DEFAULT_MINUTES  25    // Classic Pomodoro length
 
 // ── OLED Config ──────────────────────────────────────────────
@@ -28,6 +28,11 @@ TimerState currentState = SETTING;
 unsigned long timerStartTime = 0;
 unsigned long timerDurationMs = 0;
 unsigned long timeRemainingMs = 0;
+
+// Track the setting phase colors and timeouts
+CRGB settingColor = CRGB(0, 0, 0);
+unsigned long lastSettingChangeTime = 0;
+int lastSettingVal = DEFAULT_MINUTES;
 
 // ── Globals ──────────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
@@ -132,6 +137,23 @@ void loop() {
         encoderValue = val;
         interrupts();
 
+        // Trigger smooth Green/Red flashes based on turn direction
+        if (val > lastSettingVal) {
+            settingColor = CRGB(0, 255, 0); // Green for increase
+            lastSettingChangeTime = millis();
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
+        } else if (val < lastSettingVal) {
+            settingColor = CRGB(255, 0, 0); // Red for decrease
+            lastSettingChangeTime = millis();
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 255);
+        }
+        lastSettingVal = val;
+
+        // Smoothly fade out to black if the encoder stops moving
+        if (millis() - lastSettingChangeTime > 300) {
+            for (int i = 0; i < NUM_LEDS; i++) startFade(i, 0);
+        }
+
         if (pressed) {
             currentState = RUNNING;
             timerDurationMs = (unsigned long)val * 60000UL;
@@ -162,31 +184,26 @@ void loop() {
         }
     }
 
-    // ── LED TARGET LOGIC ──
+    // ── LED TARGET LOGIC (Running & Finished) ──
     int litLeds = 0;
-
-    if (currentState == SETTING) {
-        // Show proportional ring of time being set
-        litLeds = map(val, 0, MAX_MINUTES, 0, NUM_LEDS);
-        if (val > 0 && litLeds == 0) litLeds = 1;
-    } 
-    else if (currentState == RUNNING) {
-        // Map remaining time to LEDs (using ceil equivalent so last LED stays on until 0)
+    if (currentState == RUNNING) {
+        // Map remaining time to LEDs
         litLeds = (timeRemainingMs * NUM_LEDS + timerDurationMs - 1) / timerDurationMs;
     }
 
-    // Update fade targets
-    for (int i = 0; i < NUM_LEDS; i++) {
-        uint8_t desired = 0;
-        
-        if (currentState == FINISHED) {
-            // Blink all LEDs Red when done
-            desired = ((millis() - timerStartTime) % 1000 < 500) ? 255 : 0;
-        } else {
-            desired = (i < litLeds) ? 255 : 0;
+    // We only update targets here for RUNNING and FINISHED, 
+    // because SETTING handles its own all-LED targets above.
+    if (currentState != SETTING) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+            uint8_t desired = 0;
+            if (currentState == FINISHED) {
+                // Blink all LEDs Red when done
+                desired = ((millis() - timerStartTime) % 1000 < 500) ? 255 : 0;
+            } else if (currentState == RUNNING) {
+                desired = (i < litLeds) ? 255 : 0;
+            }
+            startFade(i, desired);
         }
-        
-        startFade(i, desired);
     }
 
     // ── FADE EXECUTION & COLOR MAPPING ──
@@ -207,7 +224,12 @@ void loop() {
 
         // Apply colors based on State
         if (currentState == SETTING) {
-            leds[i] = CRGB(0, 0, currentBrightness[i]); // Blue for Setting
+            // Scale the dynamically chosen setting color (Green or Red) by the current fade brightness
+            leds[i] = CRGB(
+                (settingColor.r * currentBrightness[i]) / 255,
+                (settingColor.g * currentBrightness[i]) / 255,
+                (settingColor.b * currentBrightness[i]) / 255
+            );
         } else if (currentState == RUNNING) {
             leds[i] = CRGB(0, currentBrightness[i], 0); // Green for Running
         } else {
@@ -230,8 +252,13 @@ void loop() {
             
             u8g2.setFont(u8g2_font_ncenB24_tr);
             sprintf(timeBuf, "%02d:00", val);
-            // Center the text roughly
-            u8g2.drawStr(18, 55, timeBuf);
+            
+            // Shift left slightly if it's over 99 mins to fit on screen
+            if (val >= 100) {
+                u8g2.drawStr(2, 55, timeBuf);
+            } else {
+                u8g2.drawStr(18, 55, timeBuf);
+            }
         } 
         else if (currentState == RUNNING) {
             u8g2.setFont(u8g2_font_ncenB10_tr);
@@ -243,7 +270,13 @@ void loop() {
 
             u8g2.setFont(u8g2_font_ncenB24_tr);
             sprintf(timeBuf, "%02d:%02d", m, s);
-            u8g2.drawStr(18, 50, timeBuf);
+            
+            // Shift left slightly if it's over 99 mins
+            if (m >= 100) {
+                u8g2.drawStr(2, 50, timeBuf); 
+            } else {
+                u8g2.drawStr(18, 50, timeBuf);
+            }
 
             // Progress Bar
             int barWidth = map(timeRemainingMs, 0, timerDurationMs, 0, 128);
